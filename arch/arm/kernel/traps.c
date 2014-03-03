@@ -36,10 +36,14 @@
 #include <asm/system_misc.h>
 #include <mach/restart.h>
 
-#include "signal.h"
+#include <trace/events/exception.h>
 
 static const char *handler[]= { "prefetch abort", "data abort", "address exception", "interrupt" };
 
+#ifdef CONFIG_LGE_CRASH_HANDLER
+static int first_call_chain = 0;
+static int first_die = 1;
+#endif
 void *vectors_page;
 
 #ifdef CONFIG_DEBUG_USER
@@ -58,7 +62,14 @@ static void dump_mem(const char *, const char *, unsigned long, unsigned long);
 void dump_backtrace_entry(unsigned long where, unsigned long from, unsigned long frame)
 {
 #ifdef CONFIG_KALLSYMS
+#ifdef CONFIG_LGE_CRASH_HANDLER
+	if (first_call_chain)
+		set_crash_store_enable();
+#endif
 	printk("[<%08lx>] (%pS) from [<%08lx>] (%pS)\n", where, (void *)where, from, (void *)from);
+#ifdef CONFIG_LGE_CRASH_HANDLER
+	set_crash_store_disable();
+#endif
 #else
 	printk("Function entered at [<%08lx>] from [<%08lx>]\n", where, from);
 #endif
@@ -68,6 +79,11 @@ void dump_backtrace_entry(unsigned long where, unsigned long from, unsigned long
 }
 
 #ifndef CONFIG_ARM_UNWIND
+/*
+ * Stack pointers should always be within the kernels view of
+ * physical memory.  If it is not there, then we can't dump
+ * out any information relating to the stack.
+ */
 static int verify_stack(unsigned long sp)
 {
 	if (sp < PAGE_OFFSET ||
@@ -78,6 +94,9 @@ static int verify_stack(unsigned long sp)
 }
 #endif
 
+/*
+ * Dump out the contents of some memory nicely...
+ */
 static void dump_mem(const char *lvl, const char *str, unsigned long bottom,
 		     unsigned long top)
 {
@@ -85,6 +104,11 @@ static void dump_mem(const char *lvl, const char *str, unsigned long bottom,
 	mm_segment_t fs;
 	int i;
 
+	/*
+	 * We need to switch to kernel mode so that we can use __get_user
+	 * to safely read from kernel space.  Note that we now dump the
+	 * code first, just in case the backtrace kills us.
+	 */
 	fs = get_fs();
 	set_fs(KERNEL_DS);
 
@@ -121,6 +145,11 @@ static void dump_instr(const char *lvl, struct pt_regs *regs)
 	char str[sizeof("00000000 ") * 5 + 2 + 1], *p = str;
 	int i;
 
+	/*
+	 * We need to switch to kernel mode so that we can use __get_user
+	 * to safely read from kernel space.  Note that we now dump the
+	 * code first, just in case the backtrace kills us.
+	 */
 	fs = get_fs();
 	set_fs(KERNEL_DS);
 
@@ -223,12 +252,23 @@ static int __die(const char *str, int err, struct thread_info *thread, struct pt
 	int ret;
 	unsigned long work_func;
 
-	char func_sym[KSYM_SYMBOL_LEN];
+#ifdef CONFIG_LGE_CRASH_HANDLER
+	if (first_die) {
+		first_call_chain = 1;
+		first_die = 0;
+	}
+	set_kernel_crash_magic_number();
+	set_crash_store_enable();
+#endif
 
 	printk(KERN_EMERG "Internal error: %s: %x [#%d]" S_PREEMPT S_SMP
 	       S_ISA "\n", str, err, ++die_counter);
 
-	
+#ifdef CONFIG_LGE_CRASH_HANDLER
+	set_crash_store_disable();
+#endif
+
+	/* trap and error numbers are mostly meaningless on ARM */
 	ret = notify_die(DIE_OOPS, str, regs, err, tsk->thread.trap_no, SIGSEGV);
 	if (ret == NOTIFY_STOP)
 		return ret;
@@ -251,6 +291,9 @@ static int __die(const char *str, int err, struct thread_info *thread, struct pt
 			 THREAD_SIZE + (unsigned long)task_stack_page(tsk));
 		dump_backtrace(regs, tsk);
 		dump_instr(KERN_EMERG, regs);
+#ifdef CONFIG_LGE_CRASH_HANDLER
+		first_call_chain = 0;
+#endif
 	}
 
 	return ret;
@@ -258,8 +301,9 @@ static int __die(const char *str, int err, struct thread_info *thread, struct pt
 
 static DEFINE_RAW_SPINLOCK(die_lock);
 
-extern int ramdump_source;
-char ramdump_buf[256] = "";
+/*
+ * This function is protected against re-entrancy.
+ */
 void die(const char *str, struct pt_regs *regs, int err)
 {
 	struct thread_info *thread = current_thread_info();
@@ -300,10 +344,9 @@ void die(const char *str, struct pt_regs *regs, int err)
 	}
 
 	if (in_interrupt())
-		panic(ramdump_buf);
+		panic("Fatal exception in interrupt");
 	if (panic_on_oops)
-		panic(ramdump_buf);
-	ramdump_source=0;
+		panic("Fatal exception");
 	if (ret != NOTIFY_STOP)
 		do_exit(SIGSEGV);
 }
@@ -384,6 +427,11 @@ asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
 	siginfo_t info;
 	void __user *pc;
 
+	/*
+	 * According to the ARM ARM, PC is 2 or 4 bytes ahead,
+	 * depending whether we're in Thumb mode or not.
+	 * Correct this offset.
+	 */
 	regs->ARM_pc -= correction;
 
 	pc = (void __user *)instruction_pointer(regs);
@@ -400,20 +448,25 @@ asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
 #endif
 			instr = *(u32 *) pc;
 	} else if (thumb_mode(regs)) {
-		get_user(instr, (u16 __user *)pc);
+		if (get_user(instr, (u16 __user *)pc))
+			goto die_sig;
 		if (is_wide_instruction(instr)) {
 			unsigned int instr2;
-			get_user(instr2, (u16 __user *)pc+1);
+			if (get_user(instr2, (u16 __user *)pc+1))
+				goto die_sig;
 			instr <<= 16;
 			instr |= instr2;
 		}
-	} else {
-		get_user(instr, (u32 __user *)pc);
+	} else if (get_user(instr, (u32 __user *)pc)) {
+		goto die_sig;
 	}
 
 	if (call_undef_hook(regs, instr) == 0)
 		return;
 
+	trace_undef_instr(regs, (void *)pc);
+
+die_sig:
 #ifdef CONFIG_DEBUG_USER
 	if (user_debug & UDBG_UNDEFINED) {
 		printk(KERN_INFO "%s (%d): undefined instruction: pc=%p\n",
@@ -438,6 +491,12 @@ asmlinkage void do_unexp_fiq (struct pt_regs *regs)
 	printk("You may have a hardware problem...\n");
 }
 
+/*
+ * bad_mode handles the impossible case in the vectors.  If you see one of
+ * these, then it's extremely serious, and could mean you have buggy hardware.
+ * It never returns, and never tries to sync.  We hope that we can at least
+ * dump out some state information...
+ */
 asmlinkage void bad_mode(struct pt_regs *regs, int reason)
 {
 	console_verbose();
@@ -479,30 +538,71 @@ static int bad_syscall(int n, struct pt_regs *regs)
 	return regs->ARM_r0;
 }
 
-static inline void
-do_cache_op(unsigned long start, unsigned long end, int flags)
+static long do_cache_op_restart(struct restart_block *);
+
+static inline int
+__do_cache_op(unsigned long start, unsigned long end)
 {
-	struct mm_struct *mm = current->active_mm;
-	struct vm_area_struct *vma;
+	int ret;
 
-	if (end < start || flags)
-		return;
+	do {
+		unsigned long chunk = min(PAGE_SIZE, end - start);
 
-	down_read(&mm->mmap_sem);
-	vma = find_vma(mm, start);
-	if (vma && vma->vm_start < end) {
-		if (start < vma->vm_start)
-			start = vma->vm_start;
-		if (end > vma->vm_end)
-			end = vma->vm_end;
+		if (signal_pending(current)) {
+			struct thread_info *ti = current_thread_info();
 
-		up_read(&mm->mmap_sem);
-		flush_cache_user_range(start, end);
-		return;
-	}
-	up_read(&mm->mmap_sem);
+			ti->restart_block = (struct restart_block) {
+				.fn	= do_cache_op_restart,
+			};
+
+			ti->arm_restart_block = (struct arm_restart_block) {
+				{
+					.cache = {
+						.start	= start,
+						.end	= end,
+					},
+				},
+			};
+
+			return -ERESTART_RESTARTBLOCK;
+		}
+
+		ret = flush_cache_user_range(start, start + chunk);
+		if (ret)
+			return ret;
+
+		cond_resched();
+		start += chunk;
+	} while (start < end);
+
+	return 0;
 }
 
+static long do_cache_op_restart(struct restart_block *unused)
+{
+	struct arm_restart_block *restart_block;
+
+	restart_block = &current_thread_info()->arm_restart_block;
+	return __do_cache_op(restart_block->cache.start,
+			     restart_block->cache.end);
+}
+
+static inline int
+do_cache_op(unsigned long start, unsigned long end, int flags)
+{
+	if (end < start || flags)
+		return -EINVAL;
+
+	if (!access_ok(VERIFY_READ, start, end - start))
+		return -EFAULT;
+
+	return __do_cache_op(start, end);
+}
+
+/*
+ * Handle all unrecognised system calls.
+ *  0x9f0000 - 0x9fffff are some more esoteric system calls
+ */
 #define NR(x) ((__ARM_NR_##x) - __ARM_NR_BASE)
 asmlinkage int arm_syscall(int no, struct pt_regs *regs)
 {
@@ -513,7 +613,7 @@ asmlinkage int arm_syscall(int no, struct pt_regs *regs)
 		return bad_syscall(no, regs);
 
 	switch (no & 0xffff) {
-	case 0: 
+	case 0: /* branch through 0 */
 		info.si_signo = SIGSEGV;
 		info.si_errno = 0;
 		info.si_code  = SEGV_MAPERR;
@@ -522,14 +622,27 @@ asmlinkage int arm_syscall(int no, struct pt_regs *regs)
 		arm_notify_die("branch through zero", regs, &info, 0, 0);
 		return 0;
 
-	case NR(breakpoint): 
+	case NR(breakpoint): /* SWI BREAK_POINT */
 		regs->ARM_pc -= thumb_mode(regs) ? 2 : 4;
 		ptrace_break(current, regs);
 		return regs->ARM_r0;
 
+	/*
+	 * Flush a region from virtual address 'r0' to virtual address 'r1'
+	 * _exclusive_.  There is no alignment requirement on either address;
+	 * user space does not need to know the hardware cache layout.
+	 *
+	 * r2 contains flags.  It should ALWAYS be passed as ZERO until it
+	 * is defined to be something else.  For now we ignore it, but may
+	 * the fires of hell burn in your belly if you break this rule. ;)
+	 *
+	 * (at a later date, we may want to allow this call to not flush
+	 * various aspects of the cache.  Passing '0' will guarantee that
+	 * everything necessary gets flushed to maintain consistency in
+	 * the specified region).
+	 */
 	case NR(cacheflush):
-		do_cache_op(regs->ARM_r0, regs->ARM_r1, regs->ARM_r2);
-		return 0;
+		return do_cache_op(regs->ARM_r0, regs->ARM_r1, regs->ARM_r2);
 
 	case NR(usr26):
 		if (!(elf_hwcap & HWCAP_26BIT))
@@ -544,18 +657,35 @@ asmlinkage int arm_syscall(int no, struct pt_regs *regs)
 		return regs->ARM_r0;
 
 	case NR(set_tls):
-		thread->tp_value = regs->ARM_r0;
+		thread->tp_value[0] = regs->ARM_r0;
 		if (tls_emu)
 			return 0;
 		if (has_tls_reg) {
 			asm ("mcr p15, 0, %0, c13, c0, 3"
 				: : "r" (regs->ARM_r0));
 		} else {
+			/*
+			 * User space must never try to access this directly.
+			 * Expect your app to break eventually if you do so.
+			 * The user helper at 0xffff0fe0 must be used instead.
+			 * (see entry-armv.S for details)
+			 */
 			*((unsigned int *)0xffff0ff0) = regs->ARM_r0;
 		}
 		return 0;
 
 #ifdef CONFIG_NEEDS_SYSCALL_FOR_CMPXCHG
+	/*
+	 * Atomically store r1 in *r2 if *r2 is equal to r0 for user space.
+	 * Return zero in r0 if *MEM was changed or non-zero if no exchange
+	 * happened.  Also set the user C flag accordingly.
+	 * If access permissions have to be fixed up then non-zero is
+	 * returned and the operation has to be re-attempted.
+	 *
+	 * *NOTE*: This is a ghost syscall private to the kernel.  Only the
+	 * __kuser_cmpxchg code in entry-armv.S should be aware of its
+	 * existence.  Don't ever use this from user code.
+	 */
 	case NR(cmpxchg):
 	for (;;) {
 		extern void do_DataAbort(unsigned long addr, unsigned int fsr,
@@ -591,17 +721,25 @@ asmlinkage int arm_syscall(int no, struct pt_regs *regs)
 
 		bad_access:
 		up_read(&mm->mmap_sem);
-		
+		/* simulate a write access fault */
 		do_DataAbort(addr, 15 + (1 << 11), regs);
 	}
 #endif
 
 	default:
+		/* Calls 9f00xx..9f07ff are defined to return -ENOSYS
+		   if not implemented, rather than raising SIGILL.  This
+		   way the calling program can gracefully determine whether
+		   a feature is supported.  */
 		if ((no & 0xffff) <= 0x7ff)
 			return -ENOSYS;
 		break;
 	}
 #ifdef CONFIG_DEBUG_USER
+	/*
+	 * experience shows that these seem to indicate that
+	 * something catastrophic has happened
+	 */
 	if (user_debug & UDBG_SYSCALL) {
 		printk("[%d] %s: arm syscall %d\n",
 		       task_pid_nr(current), current->comm, no);
@@ -624,13 +762,20 @@ asmlinkage int arm_syscall(int no, struct pt_regs *regs)
 
 #ifdef CONFIG_TLS_REG_EMUL
 
+/*
+ * We might be running on an ARMv6+ processor which should have the TLS
+ * register but for some reason we can't use it, or maybe an SMP system
+ * using a pre-ARMv6 processor (there are apparently a few prototypes like
+ * that in existence) and therefore access to that register must be
+ * emulated.
+ */
 
 static int get_tp_trap(struct pt_regs *regs, unsigned int instr)
 {
 	int reg = (instr >> 12) & 15;
 	if (reg == 15)
 		return 1;
-	regs->uregs[reg] = current_thread_info()->tp_value;
+	regs->uregs[reg] = current_thread_info()->tp_value[0];
 	regs->ARM_pc += 4;
 	return 0;
 }
@@ -661,6 +806,10 @@ void __bad_xchg(volatile void *ptr, int size)
 }
 EXPORT_SYMBOL(__bad_xchg);
 
+/*
+ * A data abort trap was taken, but we did not handle the instruction.
+ * Try to abort the user program, or panic if it was the kernel.
+ */
 asmlinkage void
 baddataabort(int code, unsigned long instr, struct pt_regs *regs)
 {
@@ -717,7 +866,7 @@ void abort(void)
 {
 	BUG();
 
-	
+	/* if that doesn't kill us, halt */
 	panic("Oops failed to kill thread");
 }
 EXPORT_SYMBOL(abort);
@@ -727,33 +876,55 @@ void __init trap_init(void)
 	return;
 }
 
-static void __init kuser_get_tls_init(unsigned long vectors)
+#ifdef CONFIG_KUSER_HELPERS
+static void __init kuser_init(void *vectors)
 {
+	extern char __kuser_helper_start[], __kuser_helper_end[];
+	int kuser_sz = __kuser_helper_end - __kuser_helper_start;
+
+	memcpy(vectors + 0x1000 - kuser_sz, __kuser_helper_start, kuser_sz);
+
+	/*
+	 * vectors + 0xfe0 = __kuser_get_tls
+	 * vectors + 0xfe8 = hardware TLS instruction at 0xffff0fe8
+	 */
 	if (tls_emu || has_tls_reg)
-		memcpy((void *)vectors + 0xfe0, (void *)vectors + 0xfe8, 4);
+		memcpy(vectors + 0xfe0, vectors + 0xfe8, 4);
 }
+#else
+static void __init kuser_init(void *vectors)
+{
+}
+#endif
 
 void __init early_trap_init(void *vectors_base)
 {
 	unsigned long vectors = (unsigned long)vectors_base;
 	extern char __stubs_start[], __stubs_end[];
 	extern char __vectors_start[], __vectors_end[];
-	extern char __kuser_helper_start[], __kuser_helper_end[];
-	int kuser_sz = __kuser_helper_end - __kuser_helper_start;
+	unsigned i;
 
 	vectors_page = vectors_base;
 
+	/*
+	 * Poison the vectors page with an undefined instruction.  This
+	 * instruction is chosen to be undefined for both ARM and Thumb
+	 * ISAs.  The Thumb version is an undefined instruction with a
+	 * branch back to the undefined instruction.
+	 */
+	for (i = 0; i < PAGE_SIZE / sizeof(u32); i++)
+		((u32 *)vectors_base)[i] = 0xe7fddef1;
+
+	/*
+	 * Copy the vectors, stubs and kuser helpers (in entry-armv.S)
+	 * into the vector page, mapped at 0xffff0000, and ensure these
+	 * are visible to the instruction stream.
+	 */
 	memcpy((void *)vectors, __vectors_start, __vectors_end - __vectors_start);
-	memcpy((void *)vectors + 0x200, __stubs_start, __stubs_end - __stubs_start);
-	memcpy((void *)vectors + 0x1000 - kuser_sz, __kuser_helper_start, kuser_sz);
+	memcpy((void *)vectors + 0x1000, __stubs_start, __stubs_end - __stubs_start);
 
-	kuser_get_tls_init(vectors);
+	kuser_init(vectors_base);
 
-	memcpy((void *)(vectors + KERN_SIGRETURN_CODE - CONFIG_VECTORS_BASE),
-	       sigreturn_codes, sizeof(sigreturn_codes));
-	memcpy((void *)(vectors + KERN_RESTART_CODE - CONFIG_VECTORS_BASE),
-	       syscall_restart_code, sizeof(syscall_restart_code));
-
-	flush_icache_range(vectors, vectors + PAGE_SIZE);
+	flush_icache_range(vectors, vectors + PAGE_SIZE * 2);
 	modify_domain(DOMAIN_USER, DOMAIN_CLIENT);
 }

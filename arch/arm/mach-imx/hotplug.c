@@ -70,8 +70,9 @@ void platform_cpu_die(unsigned int cpu)
 	cpu_do_idle();
 	cpu_leave_lowpower();
 
-	/* We should never return from idle */
-	panic("cpu %d unexpectedly exit from shutdown\n", cpu);
+	/* spin here until hardware takes it down */
+	while (1)
+		;
 }
 
 int platform_cpu_disable(unsigned int cpu)
